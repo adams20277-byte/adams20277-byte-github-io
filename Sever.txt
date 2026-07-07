@@ -1,0 +1,327 @@
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ── Supabase client ──
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// ── AI response pool ──
+const aiResponses = [
+    "That's really sweet of you to say! 🥰 I love getting to know someone who's genuine like you.",
+    "I have to admit, you're making me smile right now 😊 What's been the highlight of your week?",
+    "You know, I feel like we're really connecting here 💕 Tell me something that makes you truly happy.",
+    "That's so thoughtful! I love how open you are with me 🫶 It makes me feel really comfortable.",
+    "Honestly, I've been thinking about you more than I expected 😏 What are you looking for in a connection?",
+    "You have such a warm energy about you ✨ I could talk to you all day.",
+    "I love that we can have these deep conversations 💭 It means so much to me.",
+    "You're really special, you know that? 💖 I hope we can keep building this connection.",
+    "I feel like I can be completely myself with you 🥹 That's rare and beautiful.",
+    "Every message from you makes my day better 🌸 I'm so grateful we matched.",
+    "You're so easy to talk to 😊 I could honestly see this going somewhere really beautiful.",
+    "I love your vibe! 💫 Let's keep getting to know each other, okay?",
+    "You just have a way of making me feel seen 🫂 I really appreciate that.",
+    "I'm honestly so curious about you 🤗 Tell me more about what makes you tick.",
+    "This feels so natural with you 🌹 Like we've known each other forever.",
+    "You're giving me all the feels right now 😅 In the best way possible.",
+    "I love how we just get each other 💕 It's like you understand me without me even saying much.",
+    "You're honestly so attractive to me 🥵 Not just looks, but your whole energy.",
+    "I could listen to you talk forever 🎧 You have that effect on people.",
+    "You make me want to open up more 💗 I trust you, and that's a big deal for me."
+];
+
+function getAIResponse() {
+    return aiResponses[Math.floor(Math.random() * aiResponses.length)];
+}
+
+// ── Helper: get global AI setting ──
+async function getGlobalAI() {
+    const { data, error } = await supabase
+        .from('admin_settings')
+        .select('global_ai_enabled')
+        .single();
+    if (error || !data) return true; // default on
+    return data.global_ai_enabled;
+}
+
+// ── Helper: get per-user AI setting ──
+async function getUserAI(userId) {
+    const { data, error } = await supabase
+        .from('ai_settings')
+        .select('ai_enabled')
+        .eq('user_id', userId)
+        .single();
+    if (error || !data) return null; // null = use global
+    return data.ai_enabled;
+}
+
+// ── Helper: ensure user has a profile (create if not exists) ──
+async function ensureProfile(userId, email, firstName, lastName, phone, dob, gender) {
+    // Check if profile exists
+    const { data: existing } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', userId)
+        .single();
+    if (existing) return;
+
+    // Create profile
+    const { error } = await supabase
+        .from('profiles')
+        .insert({
+            id: userId,
+            email: email,
+            first_name: firstName,
+            last_name: lastName,
+            phone: phone,
+            dob: dob,
+            gender: gender,
+            avatar_url: null,
+            created_at: new Date().toISOString()
+        });
+    if (error) throw new Error('Failed to create profile: ' + error.message);
+}
+
+// ── Endpoints ──
+
+// 1. Signup – creates auth user and profile
+app.post('/signup', async (req, res) => {
+    const { firstName, lastName, email, phone, dob, gender, password } = req.body;
+
+    try {
+        // Create auth user using Supabase Auth
+        const { data: authData, error: authError } = await supabase.auth.signUp({
+            email,
+            password,
+            options: {
+                data: {
+                    first_name: firstName,
+                    last_name: lastName,
+                }
+            }
+        });
+        if (authError) throw authError;
+
+        const userId = authData.user.id;
+
+        // Create profile
+        await ensureProfile(userId, email, firstName, lastName, phone, dob, gender);
+
+        // Generate OTP (for demo – we'll store in a table later)
+        const otp = Math.floor(100000 + Math.random() * 900000);
+        // In production, send OTP via email. For now, return it.
+        res.json({ success: true, userId, otp });
+
+    } catch (error) {
+        console.error('Signup error:', error);
+        res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+// 2. Verify OTP (demo – just checks length)
+app.post('/verify-otp', (req, res) => {
+    const { userId, otp } = req.body;
+    if (otp && otp.length === 6) {
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ success: false });
+    }
+});
+
+// 3. Chat – send message, get AI reply if enabled
+app.post('/chat', async (req, res) => {
+    const { userId, receiverId, message } = req.body;
+    if (!userId || !receiverId || !message) {
+        return res.status(400).json({ error: 'Missing userId, receiverId, or message' });
+    }
+
+    try {
+        // Store user message
+        const { error: insertError } = await supabase
+            .from('messages')
+            .insert({
+                sender_id: userId,
+                receiver_id: receiverId,
+                text: message,
+                timestamp: new Date().toISOString(),
+                is_read: false
+            });
+        if (insertError) throw insertError;
+
+        // Determine if AI should reply
+        const globalAI = await getGlobalAI();
+        let userAI = await getUserAI(userId);
+        // If userAI is null, use global; if false, AI off; if true, AI on
+        const aiEnabled = (userAI !== null) ? userAI : globalAI;
+
+        let aiReply = null;
+        if (aiEnabled) {
+            // Get AI reply
+            aiReply = getAIResponse();
+            // Store AI reply as coming from receiver? Actually, AI replies as the receiver (the profile)
+            // For simplicity, we store as sender = receiverId? But we want to show as AI reply.
+            // We'll store it as sender = receiverId (the profile) so it appears as the other person.
+            // Alternatively, we could store with sender = 'ai' but we keep consistent: sender is the user who sends.
+            // We'll store as sender = receiverId, text = aiReply.
+            const { error: aiError } = await supabase
+                .from('messages')
+                .insert({
+                    sender_id: receiverId,   // The profile sends the reply
+                    receiver_id: userId,
+                    text: aiReply,
+                    timestamp: new Date(Date.now() + 1000).toISOString(), // slight delay
+                    is_read: false
+                });
+            if (aiError) throw aiError;
+        }
+
+        res.json({ success: true, aiReply });
+
+    } catch (error) {
+        console.error('Chat error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 4. Get conversation history between two users
+app.get('/conversations/:userId/:otherUserId', async (req, res) => {
+    const { userId, otherUserId } = req.params;
+    if (!userId || !otherUserId) {
+        return res.status(400).json({ error: 'Missing userId or otherUserId' });
+    }
+
+    try {
+        // Get messages where (sender=userId AND receiver=otherUserId) OR (sender=otherUserId AND receiver=userId)
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
+            .or(`sender_id.eq.${otherUserId},receiver_id.eq.${otherUserId}`)
+            .order('timestamp', { ascending: true });
+
+        if (error) throw error;
+
+        // Filter to only messages between these two users (since OR might include others)
+        const filtered = data.filter(m =>
+            (m.sender_id === userId && m.receiver_id === otherUserId) ||
+            (m.sender_id === otherUserId && m.receiver_id === userId)
+        );
+
+        res.json({ messages: filtered });
+
+    } catch (error) {
+        console.error('Get conversations error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 5. Admin: toggle AI for a specific user
+app.post('/admin/toggle-ai', async (req, res) => {
+    const { userId, enabled } = req.body;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    try {
+        // Upsert into ai_settings
+        const { error } = await supabase
+            .from('ai_settings')
+            .upsert({ user_id: userId, ai_enabled: enabled, updated_at: new Date().toISOString() })
+            .match({ user_id: userId });
+
+        if (error) throw error;
+        res.json({ success: true, enabled });
+
+    } catch (error) {
+        console.error('Admin toggle AI error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 6. Admin: send message as admin (appears as 'admin' sender, we'll store with sender_id = 'admin')
+app.post('/admin/send', async (req, res) => {
+    const { userId, message } = req.body;
+    if (!userId || !message) return res.status(400).json({ error: 'Missing data' });
+
+    try {
+        const { error } = await supabase
+            .from('messages')
+            .insert({
+                sender_id: 'admin',
+                receiver_id: userId,
+                text: message,
+                timestamp: new Date().toISOString(),
+                is_read: false
+            });
+        if (error) throw error;
+        res.json({ success: true });
+
+    } catch (error) {
+        console.error('Admin send error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 7. Admin: global AI toggle
+app.post('/admin/global-ai', async (req, res) => {
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'Invalid enabled value' });
+
+    try {
+        // Update admin_settings (assumes only one row)
+        const { error } = await supabase
+            .from('admin_settings')
+            .upsert({ id: 1, global_ai_enabled: enabled, updated_at: new Date().toISOString() })
+            .match({ id: 1 });
+
+        if (error) throw error;
+        res.json({ success: true, global_ai_enabled: enabled });
+
+    } catch (error) {
+        console.error('Global AI toggle error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 8. Get all users (for admin)
+app.get('/admin/users', async (req, res) => {
+    try {
+        // For simplicity, we can get from profiles table
+        const { data, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json({ users: data });
+
+    } catch (error) {
+        console.error('Get users error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 9. Get all messages (admin view) – optional
+app.get('/admin/messages', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .order('timestamp', { ascending: false })
+            .limit(200);
+
+        if (error) throw error;
+        res.json({ messages: data });
+
+    } catch (error) {
+        console.error('Get messages error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
